@@ -6,6 +6,13 @@ AutoClip Pro — YouTube/Twitch Live 自動クリッパー (プロトタイプ)
 
 盛り上がりを検知してOBSのリプレイバッファを自動保存・リネームする。
 SaaSモデル: Free版（YouTube, 5回/日）/ Holiday Pass（YouTube+Twitch, 無制限, 14日間）
+
+【システム全体の流れ】
+1. ChatMonitor がライブチャットを別スレッドで取得し続ける
+2. ExcitementDetector がコメントを分析して「盛り上がり」を判定する
+3. 盛り上がりが検知されると OBSController がリプレイバッファを保存する
+4. ClipNamer が保存されたファイルを意味のある名前にリネームする
+5. AutoClipApp (GUI) が全体を統括し、SaaSプランの制限を管理する
 """
 
 import os
@@ -34,7 +41,14 @@ EXTENSION_THRESHOLD_DAYS = 7
 # ExcitementDetector — 盛り上がり判定 + ジャンル分類 + トップコメント抽出
 # ---------------------------------------------------------------------------
 class ExcitementDetector:
-    """直近コメントを分析し、盛り上がりを判定。ジャンルとトップコメントを抽出する。"""
+    """
+    【役割】ライブチャットのコメントを分析し「盛り上がり」を自動検知するエンジン。
+
+    直近N秒間のコメント数が閾値を超えたとき「盛り上がり」と判定し、
+    さらにそのコメント内容から「爆笑・称賛・失敗・困惑」などジャンルを分類、
+    最も意味のあるコメントテキストを抽出する。
+    クールダウン機能により、短時間での連続誤検知を防ぐ。
+    """
 
     # NGワードジャンル辞書（キー=ジャンル名, 値=キーワードリスト）
     NG_GENRE_DICT: dict[str, list[str]] = {
@@ -102,11 +116,13 @@ class ExcitementDetector:
     def __init__(self, window_sec: int = 30, threshold: int = 10,
                  cooldown_sec: int = 60, genre_min_ratio: float = 0.10):
         """
+        【役割】盛り上がり判定の各パラメータを設定し、内部バッファを初期化する。
+
         Args:
-            window_sec: 分析ウィンドウ（秒）
-            threshold: 盛り上がり判定に必要な最低コメント数
-            cooldown_sec: 連続検知を防ぐクールダウン（秒）
-            genre_min_ratio: ジャンル確定に必要な最低比率（これ未満は「注目」）
+            window_sec: 分析対象とするコメントの時間幅（秒）。古いコメントは自動削除。
+            threshold: 盛り上がり判定に必要な最低コメント数。これ未満は無視。
+            cooldown_sec: 一度検知した後、次の検知を無視するクールダウン時間（秒）。
+            genre_min_ratio: ジャンル確定に必要なキーワードの最低出現比率（これ未満は「注目シーン」）。
         """
         self.window_sec = window_sec
         self.threshold = threshold
@@ -116,7 +132,12 @@ class ExcitementDetector:
         self.last_trigger_time: float = 0.0     # 最後にトリガーした時刻
 
     def add_comment(self, text: str, timestamp: float | None = None) -> None:
-        """コメントをウィンドウに追加し、古いものを除去する。"""
+        """
+        【役割】新しいコメントをバッファに追加し、window_sec より古いコメントを自動削除する。
+
+        ChatMonitor から呼ばれ、常に「直近N秒間のコメントのみ」がバッファに残るよう管理する。
+        これにより check_excitement() が常に最新のコメント量で判定できる。
+        """
         ts = timestamp or time.time()
         self.comments.append((ts, text))
         cutoff = ts - self.window_sec
@@ -124,7 +145,12 @@ class ExcitementDetector:
             self.comments.popleft()
 
     def check_excitement(self) -> bool:
-        """盛り上がりを判定する。閾値とクールダウンで制御。"""
+        """
+        【役割】現在のバッファ内コメント数が閾値を超えており、かつクールダウン経過済みか判定する。
+
+        True を返した場合、呼び出し元（ChatMonitor）は OBS のリプレイバッファ保存を発動する。
+        クールダウンにより、一度盛り上がりが検知された後、短時間に連続トリガーされることを防ぐ。
+        """
         if len(self.comments) < self.threshold:
             return False
         now = time.time()
@@ -134,7 +160,13 @@ class ExcitementDetector:
         return True
 
     def classify_genre(self) -> str:
-        """直近コメントからNGワードジャンルを分類し、シーン名を返す。"""
+        """
+        【役割】バッファ内のコメントを NG_GENRE_DICT のキーワードと照合し、シーンのジャンルを分類する。
+
+        「爆笑シーン」「称賛シーン」「失敗シーン」「困惑シーン」「Twitch文化シーン」のいずれかを返す。
+        最頻出ジャンルが全コメントの genre_min_ratio 未満のときは「注目シーン」を返す。
+        戻り値はそのままクリップのファイル名の一部に使用される。
+        """
         genre_counts: Counter = Counter()
         total = len(self.comments)
         if total == 0:
@@ -158,7 +190,14 @@ class ExcitementDetector:
         return f"{top_genre}シーン"
 
     def extract_top_comment(self) -> str:
-        """NGワードのみのコメントを除外し、最頻出の意味あるテキストを返す。"""
+        """
+        【役割】バッファ内から「意味のある」コメントを抽出し、最も多く投稿されたテキストを返す。
+
+        「www」「草」「GG」などの純粋なリアクションワードのみのコメントを除外し、
+        視聴者が実際に言葉で表現した内容を見つける。
+        戻り値（最大15文字）はクリップのファイル名（△△部分）として使用される。
+        意味あるコメントが1件もない場合は「リアクション多数」を返す。
+        """
         meaningful: list[str] = []
         for _, text in self.comments:
             cleaned = self._clean_text(text)
@@ -183,7 +222,13 @@ class ExcitementDetector:
     # --- 内部ヘルパー ---
 
     def _clean_text(self, text: str) -> str:
-        """絵文字・顔文字・Twitchエモート・記号を除去し、サニタイズしたテキストを返す。"""
+        """
+        【役割】コメントテキストから絵文字・顔文字を除去してサニタイズする。
+
+        extract_top_comment() の前処理として使用。
+        絵文字や顔文字を含むコメントを、テキスト部分だけに整理することで
+        意味あるコメントの抽出精度を上げる。
+        """
         t = self.RE_EMOJI.sub("", text)
         t = self.RE_KAOMOJI.sub("", t)
         t = t.strip()
@@ -194,7 +239,13 @@ class ExcitementDetector:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        """テキストを空白区切りでトークン化。日本語の場合は1コメント=1トークン扱い。"""
+        """
+        【役割】コメントテキストを単語（トークン）のリストに分割する。
+
+        英語のように空白で区切られている場合は各単語に分割する。
+        日本語のように空白がない場合はコメント全体を1トークンとして扱う。
+        classify_genre() と extract_top_comment() がキーワード照合に使用する。
+        """
         parts = text.split()
         if len(parts) <= 1:
             return [text.strip()] if text.strip() else []
@@ -205,16 +256,26 @@ class ExcitementDetector:
 # ClipNamer — ファイル命名 + サイズ安定化待ち + リネーム
 # ---------------------------------------------------------------------------
 class ClipNamer:
-    """ファイル名の生成とリネーム処理を行う。"""
+    """
+    【役割】OBS が保存したリプレイバッファファイルを、意味のある名前にリネームする。
+
+    ファイル名の形式: HHMMSS_XmYs_トップコメント_ジャンル.mp4
+    例: 012345_2m0s_神プレイ_称賛シーン.mp4
+
+    OBS はリプレイバッファ保存後もファイルへの書き込みを続けることがあるため、
+    ファイルサイズが安定（変化しなくなる）するまで待ってからリネームする。
+    """
 
     # OSで禁止されるファイル名文字
     RE_FORBIDDEN = re.compile(r'[\\/:*?"<>|]')
 
     def __init__(self, check_interval: float = 2.0, max_timeout: float = 60.0):
         """
+        【役割】ファイル書き込み完了チェックのタイミングパラメータを設定する。
+
         Args:
-            check_interval: 書き込み完了チェックの間隔（秒）
-            max_timeout: 最大待機タイムアウト（秒）
+            check_interval: ファイルサイズを確認する間隔（秒）。短すぎると書き込み中にリネームしてしまう。
+            max_timeout: この秒数待ってもファイルが安定しない場合はリネームをあきらめる。
         """
         self.check_interval = check_interval
         self.max_timeout = max_timeout
@@ -222,13 +283,22 @@ class ClipNamer:
     def generate_filename(self, elapsed_seconds: float, replay_duration: int,
                           top_comment: str, genre: str) -> str:
         """
-        HHMMSS_XmYs_△△_〇〇シーン.mp4 形式のファイル名を生成する。
+        【役割】クリップを後から探しやすくするための構造化されたファイル名を生成する。
+
+        ファイル名に「配信開始からの経過時間・クリップ長・トップコメント・ジャンル」を
+        埋め込むことで、ファイル一覧を見ただけでどの場面か把握できるようにする。
+
+        生成形式: HHMMSS_XmYs_△△_〇〇シーン.mp4
+          - HHMMSS: 配信開始からの経過時間（時分秒）
+          - XmYs:   OBSリプレイバッファの録画長
+          - △△:     視聴者のトップコメント（最大15文字）
+          - 〇〇:   ジャンル（爆笑・称賛・失敗など）
 
         Args:
             elapsed_seconds: 配信開始からの経過秒数
             replay_duration: OBSリプレイバッファ長（秒）
-            top_comment: トップコメント（△△）
-            genre: ジャンル名（〇〇シーン）
+            top_comment: ExcitementDetector が抽出したトップコメント
+            genre: ExcitementDetector が分類したジャンル名
         """
         # HHMMSS
         total_sec = int(elapsed_seconds)
@@ -256,15 +326,20 @@ class ClipNamer:
     def wait_and_rename(self, output_dir: str, new_filename: str,
                         log_callback=None) -> str | None:
         """
-        出力ディレクトリ内の最新.mp4ファイルの書き込み完了を待ち、リネームする。
+        【役割】OBS がファイルへの書き込みを完了するまで待機し、完了後にリネームする。
+
+        OBS はリプレイバッファ保存の指令を受けた直後からファイルに書き込みを始めるが、
+        書き込みが終わるまでリネームすると破損する可能性がある。
+        そのため「前回確認時と現在のファイルサイズが同じ」になるまでポーリングで待つ。
+        別スレッドから呼び出されるため、GUI をブロックしない。
 
         Args:
-            output_dir: OBSの出力ディレクトリ
-            new_filename: リネーム後のファイル名
-            log_callback: ログ出力用コールバック
+            output_dir: OBSの録画出力先ディレクトリ
+            new_filename: generate_filename() で生成したリネーム後のファイル名
+            log_callback: ログ出力用コールバック（GUIのログ欄に表示するため）
 
         Returns:
-            リネーム後のフルパス（成功時）またはNone（失敗時）
+            リネーム後のフルパス（成功時）、またはNone（タイムアウト・エラー時）
         """
         start_time = time.time()
         prev_size = -1
@@ -306,12 +381,23 @@ class ClipNamer:
         return None
 
     def _sanitize(self, text: str) -> str:
-        """ファイル名に使えない文字を除去する。"""
+        """
+        【役割】ファイル名として使用できない記号（\\ / : * ? " < > |）を除去する。
+
+        OSによって禁止されているファイル名文字を含む可能性のある
+        コメントやジャンル名を、安全なファイル名文字列に変換する。
+        """
         return self.RE_FORBIDDEN.sub("", text).strip()
 
     @staticmethod
     def _find_latest_mp4(directory: str) -> str | None:
-        """ディレクトリ内の最新のmp4ファイルを検出する。"""
+        """
+        【役割】指定ディレクトリ内で最も最近更新された mp4（または mkv）ファイルを返す。
+
+        OBS がどんな名前でリプレイバッファを保存しても対応できるよう、
+        ファイル名ではなく更新日時で「最新ファイル」を特定する。
+        mp4 が見つからない場合は mkv もチェックする（OBSの出力設定依存）。
+        """
         pattern = os.path.join(directory, "*.mp4")
         files = glob.glob(pattern)
         if not files:
@@ -324,7 +410,12 @@ class ClipNamer:
 
     @staticmethod
     def _unique_path(path: str) -> str:
-        """同名ファイルが存在する場合、連番を付与する。"""
+        """
+        【役割】指定パスに同名ファイルが存在する場合、連番を付加して重複を回避する。
+
+        同じシーンで複数回クリップが保存された場合でも上書きを防ぐ。
+        例: 012345_2m0s_神_称賛シーン.mp4 → 012345_2m0s_神_称賛シーン_1.mp4
+        """
         if not os.path.exists(path):
             return path
         base, ext = os.path.splitext(path)
@@ -338,10 +429,23 @@ class ClipNamer:
 # OBSController — OBS WebSocket v5 接続・リプレイバッファ保存
 # ---------------------------------------------------------------------------
 class OBSController:
-    """OBS Studioとの通信を管理する。"""
+    """
+    【役割】OBS Studio との WebSocket v5 通信を担当するコントローラー。
+
+    obsws-python ライブラリを介して OBS に接続し、
+    リプレイバッファの保存命令を送る。
+    また接続時に OBS の録画出力先ディレクトリを自動取得し、
+    ClipNamer がファイルを探す場所を提供する。
+    """
 
     def __init__(self, host: str = "localhost", port: int = 4455,
                  password: str = "", replay_duration: int = 30):
+        """
+        【役割】OBS への接続に必要なパラメータを保持する。
+
+        実際の接続は connect() を呼ぶまで行われない（遅延接続）。
+        replay_duration は ClipNamer のファイル名生成（XmYs部分）に使用される。
+        """
         self.host = host
         self.port = port
         self.password = password
@@ -350,7 +454,13 @@ class OBSController:
         self.output_dir: str = ""
 
     def connect(self) -> bool:
-        """OBS WebSocket v5 に接続し、出力ディレクトリを取得する。"""
+        """
+        【役割】OBS WebSocket v5 に接続し、録画出力先ディレクトリを取得する。
+
+        接続成功後に output_dir を自動で取得するため、
+        ユーザーが手動で出力先を設定する手間を省く。
+        接続失敗時は ConnectionError を発生させ、GUI 側でエラーダイアログを表示させる。
+        """
         try:
             import obsws_python as obs
             self.client = obs.ReqClient(
@@ -364,7 +474,13 @@ class OBSController:
             raise ConnectionError(f"OBS接続失敗: {e}")
 
     def save_replay_buffer(self) -> bool:
-        """リプレイバッファを保存する。"""
+        """
+        【役割】OBS に「今すぐリプレイバッファを保存せよ」という命令を送る。
+
+        盛り上がりが検知された瞬間に AutoClipApp._on_excitement() から呼ばれる。
+        このメソッドが成功すると OBS がファイルを output_dir に書き出し始める。
+        失敗時は RuntimeError を発生させ、ログに記録される。
+        """
         if not self.client:
             raise ConnectionError("OBSに接続されていません")
         try:
@@ -374,7 +490,11 @@ class OBSController:
             raise RuntimeError(f"リプレイバッファ保存失敗: {e}")
 
     def disconnect(self) -> None:
-        """接続を切断する。"""
+        """
+        【役割】OBS との WebSocket 接続を切断し、クライアントを解放する。
+
+        監視停止ボタンが押されたとき、または Free 版の上限に達したときに呼ばれる。
+        """
         self.client = None
 
 
@@ -382,16 +502,26 @@ class OBSController:
 # ChatMonitor — YouTube/Twitch チャット取得（別スレッド）
 # ---------------------------------------------------------------------------
 class ChatMonitor:
-    """chat-downloader でライブチャットを取得し、コメントを処理する。"""
+    """
+    【役割】YouTube / Twitch のライブチャットをリアルタイムで取得し、
+    コメントを ExcitementDetector に流す監視スレッドを管理する。
+
+    chat-downloader ライブラリを使ってコメントストリームを受信し、
+    コメントを受け取るたびに ExcitementDetector へ渡す。
+    盛り上がりが検知されると on_excitement コールバックを通じて
+    AutoClipApp に通知し、OBS 保存をトリガーさせる。
+    """
 
     def __init__(self, url: str, on_comment=None, on_excitement=None,
                  log_callback=None):
         """
+        【役割】チャット監視に必要な URL・コールバック・内部コンポーネントを初期化する。
+
         Args:
-            url: YouTube/Twitch の配信URL
-            on_comment: コメント受信時のコールバック (text, elapsed_sec)
-            on_excitement: 盛り上がり検知時のコールバック (genre, top_comment, elapsed_sec)
-            log_callback: ログ出力コールバック
+            url: 監視対象の YouTube または Twitch 配信 URL
+            on_comment: 各コメント受信時に呼ばれるコールバック (text, elapsed_sec)
+            on_excitement: 盛り上がり検知時に呼ばれるコールバック (genre, top_comment, elapsed_sec)
+            log_callback: ログをGUIに表示するためのコールバック
         """
         self.url = url
         self.on_comment = on_comment
@@ -404,17 +534,34 @@ class ChatMonitor:
         self.monitor_start_time: float = 0.0         # 監視開始時刻
 
     def start(self) -> None:
-        """別スレッドでチャット監視を開始する。"""
+        """
+        【役割】チャット監視を別スレッド（デーモンスレッド）として起動する。
+
+        GUI スレッドをブロックせずにチャット取得を行うために別スレッドで動かす。
+        デーモンスレッドのため、アプリ終了時に自動でスレッドも終了する。
+        """
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """監視を停止する。"""
+        """
+        【役割】チャット監視ループに停止フラグを立て、スレッドを終了させる。
+
+        _stop_event をセットすることで、_run() ループが次の反復で終了する。
+        """
         self._stop_event.set()
 
     def _run(self) -> None:
-        """チャット取得ループ（別スレッドで実行）。"""
+        """
+        【役割】別スレッドで実行されるチャット取得のメインループ。
+
+        chat-downloader でコメントストリームを受信し続け、
+        各コメントを ExcitementDetector に追加する。
+        盛り上がりが検知されたら genre・top_comment・経過時間とともに
+        on_excitement コールバックを呼び出す。
+        停止フラグが立つか、エラーが発生するとループを抜ける。
+        """
         try:
             from chat_downloader import ChatDownloader
 
@@ -466,7 +613,13 @@ class ChatMonitor:
 # SaaS プラン管理ヘルパー
 # ---------------------------------------------------------------------------
 def load_settings() -> dict:
-    """設定ファイルを読み込む。存在しなければデフォルト値を返す。"""
+    """
+    【役割】autoclip_settings.json からユーザーのプラン情報・利用履歴を読み込む。
+
+    ファイルが存在しない（初回起動）または破損している場合は
+    Free 版のデフォルト設定を返す。
+    既存ファイルに新しいキーが不足している場合はデフォルト値で補完する。
+    """
     defaults = {
         "plan": "free",                   # "free" or "holiday_pass"
         "holiday_pass_start": None,       # ISO形式の開始日時
@@ -493,13 +646,23 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
-    """設定ファイルに書き込む。"""
+    """
+    【役割】現在のプラン情報・利用カウントを autoclip_settings.json に書き込む。
+
+    Holiday Pass の有効化・日次カウントの更新・期間延長など
+    設定が変わるたびに呼ばれ、次回起動時にも状態が引き継がれるようにする。
+    """
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
 
 
 def is_holiday_pass_active(settings: dict) -> bool:
-    """Holiday Pass が有効期間内か判定する。"""
+    """
+    【役割】現在時刻が Holiday Pass の有効期間内かどうかを判定する。
+
+    plan が "holiday_pass" かつ holiday_pass_end が未来の日時であれば True を返す。
+    この関数が False を返すと、アプリは Free 版の制限（YouTube のみ・5回/日）を適用する。
+    """
     if settings.get("plan") != "holiday_pass":
         return False
     end_str = settings.get("holiday_pass_end")
@@ -513,7 +676,14 @@ def is_holiday_pass_active(settings: dict) -> bool:
 
 
 def check_daily_limit(settings: dict) -> tuple[bool, int]:
-    """Free版の日次保存上限をチェック。(上限内か, 残り回数) を返す。"""
+    """
+    【役割】Free 版ユーザーの「1日5回」クリップ保存上限を管理する。
+
+    日付をまたいだ場合はカウントを自動リセットする。
+    戻り値の1つ目は「まだ保存可能か（True/False）」、
+    2つ目は「今日の残り保存可能回数」。
+    _start_monitoring() と _on_excitement() の両方でチェックに使用される。
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     if settings.get("last_save_date") != today:
         # 日付が変わっていたらリセット
@@ -528,9 +698,22 @@ def check_daily_limit(settings: dict) -> tuple[bool, int]:
 # AutoClipApp — メインGUI（Tkinter）
 # ---------------------------------------------------------------------------
 class AutoClipApp:
-    """Tkinterベースのメインアプリケーション。SaaSプラン管理を含む。"""
+    """
+    【役割】システム全体を統括する Tkinter ベースのメインアプリケーション。
+
+    GUI の構築・ユーザー入力の受付・各コンポーネント（OBSController / ChatMonitor /
+    ClipNamer / ExcitementDetector）の生成と協調を担当する。
+    また SaaS プランの制限（Free版/Holiday Pass）を監視・強制し、
+    チュートリアル完了後の Holiday Pass 獲得フロー・期間延長フローを管理する。
+    """
 
     def __init__(self, root: tk.Tk):
+        """
+        【役割】アプリ起動時の初期化処理をまとめる。
+
+        設定ファイルを読み込み、GUI を構築し、ログポーリングを開始する。
+        起動後 500ms 後に Holiday Pass の期限チェックを非同期で実施する。
+        """
         self.root = root
         self.root.title("AutoClip Pro")
         self.root.geometry("700x680")
@@ -556,7 +739,13 @@ class AutoClipApp:
     # ==================== GUI構築 ====================
 
     def _build_gui(self) -> None:
-        """GUIウィジェットを構築する。"""
+        """
+        【役割】アプリ画面に表示される全 UI ウィジェットを生成・配置する。
+
+        上から順に「プランステータスバー → URL入力 → OBS接続設定 →
+        操作ボタン → ログ表示エリア」を構築する。
+        各入力値は StringVar で保持し、監視開始時に読み取られる。
+        """
         # --- プランステータスバー ---
         status_frame = ttk.LabelFrame(self.root, text="プランステータス")
         status_frame.pack(fill="x", padx=10, pady=(10, 5))
@@ -647,7 +836,14 @@ class AutoClipApp:
     # ==================== プランステータス ====================
 
     def _update_plan_label(self) -> None:
-        """プランステータスラベルを更新する。"""
+        """
+        【役割】現在のプラン状態を画面上部のステータスバーに反映する。
+
+        Holiday Pass が有効なら残り日数と無制限表示（緑）、
+        Free 版なら残り保存回数（青）を表示する。
+        Holiday Pass が期限切れの場合は plan を "free" に自動ダウングレードする。
+        保存が発生するたびに呼ばれ、リアルタイムで残り回数を更新する。
+        """
         if is_holiday_pass_active(self.settings):
             end_dt = datetime.fromisoformat(self.settings["holiday_pass_end"])
             remaining = (end_dt - datetime.now()).days
@@ -669,7 +865,13 @@ class AutoClipApp:
     # ==================== 監視制御 ====================
 
     def _start_monitoring(self) -> None:
-        """監視を開始する。プランに応じたバリデーションを実施。"""
+        """
+        【役割】「監視開始」ボタンが押されたときの処理を担う。
+
+        入力バリデーション（URL未入力・Free版でのTwitch URL・日次上限）を行い、
+        問題がなければ OBSController に接続し、ClipNamer と ChatMonitor を初期化して
+        監視を開始する。バリデーションに失敗した場合はダイアログを表示して中断する。
+        """
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("入力エラー", "配信URLを入力してください。")
@@ -732,7 +934,12 @@ class AutoClipApp:
         self._log("[App] 監視を開始しました")
 
     def _stop_monitoring(self) -> None:
-        """監視を停止する。"""
+        """
+        【役割】「監視停止」ボタンが押されたときにチャット監視と OBS 接続を終了する。
+
+        ChatMonitor のスレッドに停止フラグを立て、OBSController の接続を切断する。
+        ボタンの有効・無効状態を反転し、ユーザーが再度監視を開始できる状態に戻す。
+        """
         if self.chat_monitor:
             self.chat_monitor.stop()
         if self.obs_controller:
@@ -745,11 +952,26 @@ class AutoClipApp:
     # ==================== コールバック ====================
 
     def _on_comment(self, text: str, elapsed: float) -> None:
-        """コメント受信時（軽量ログのみ）。"""
+        """
+        【役割】各コメント受信時に呼ばれるコールバック（現在は処理なし）。
+
+        全コメントをログに出力するとパフォーマンスが低下するため意図的にスキップしている。
+        将来的にコメント表示機能を追加する場合はここに実装する。
+        """
         pass  # 全コメントをログに出すと重いのでスキップ
 
     def _on_excitement(self, genre: str, top_comment: str, elapsed: float) -> None:
-        """盛り上がり検知時のメインハンドラ。"""
+        """
+        【役割】盛り上がり検知時のメインハンドラ。システムの中核となる処理を担う。
+
+        以下の順序で処理を実行する:
+        1. Free 版の日次上限を再チェックし、超過なら監視を停止する
+        2. OBSController.save_replay_buffer() でリプレイバッファを保存する
+        3. 保存カウントをインクリメントし設定ファイルに書き込む
+        4. ClipNamer.generate_filename() でファイル名を生成する
+        5. 別スレッドで ClipNamer.wait_and_rename() を実行しリネームする
+        6. 初回保存の場合、Holiday Pass 獲得ポップアップを表示する
+        """
         # Free版の日次上限チェック
         is_pro = is_holiday_pass_active(self.settings)
         if not is_pro:
@@ -803,7 +1025,12 @@ class AutoClipApp:
     # ==================== Holiday Pass フロー ====================
 
     def _show_holiday_pass_offer(self) -> None:
-        """チュートリアル完了後、Holiday Pass 獲得ポップアップを表示する。"""
+        """
+        【役割】初回クリップ保存（チュートリアル完了）後に Holiday Pass 獲得を案内する。
+
+        ユーザーが「はい」を選ぶと登録フロー（_show_registration_window）に進む。
+        これが SaaS のコンバージョンファネルの入口となる。
+        """
         result = messagebox.askyesno(
             "🎉 Holiday Pass 獲得！",
             "おめでとうございます！初回の自動保存を達成しました。\n\n"
@@ -815,7 +1042,13 @@ class AutoClipApp:
             self._show_registration_window()
 
     def _show_registration_window(self) -> None:
-        """ダミーのメールアドレス・カード登録ウィンドウを表示する。"""
+        """
+        【役割】Holiday Pass 登録用のダミーフォーム（メール・クレジットカード）を表示する。
+
+        現時点はプロトタイプのため実際の決済処理は行わない（ダミー画面）。
+        「登録して次へ」を押すと _show_survey_window() へ進む。
+        モーダルウィンドウとして表示し、登録完了まで他の操作をブロックする。
+        """
         win = tk.Toplevel(self.root)
         win.title("Holiday Pass — アカウント登録")
         win.geometry("450x350")
@@ -874,7 +1107,14 @@ class AutoClipApp:
         ttk.Button(win, text="登録して次へ →", command=on_submit).pack(pady=10)
 
     def _show_survey_window(self) -> None:
-        """ダミーの初期アンケートウィンドウを表示する。"""
+        """
+        【役割】Holiday Pass 有効化前の初期アンケートを収集し、回答後にパスを有効化する。
+
+        配信プラットフォーム・配信時間・クリップ用途の3問を収集する。
+        「回答を送信」後に settings の plan を "holiday_pass" に更新し、
+        14日間の有効期限を設定して save_settings() で保存する。
+        これがコンバージョンファネルの最終ステップとなる。
+        """
         win = tk.Toplevel(self.root)
         win.title("Holiday Pass — 初期アンケート")
         win.geometry("450x380")
@@ -935,7 +1175,13 @@ class AutoClipApp:
         )
 
     def _check_extension_prompt(self) -> None:
-        """起動時: Holiday Pass 残り7日未満なら延長アンケートを表示する。"""
+        """
+        【役割】起動時に Holiday Pass の残り期間を確認し、7日未満なら延長を提案する。
+
+        既に延長済み（extended=True）の場合はスキップする。
+        ユーザーが「はい」を選ぶと _show_extension_survey() を呼び出す。
+        起動直後の 500ms 後に非同期で実行されるため、GUI 表示を妨げない。
+        """
         if not is_holiday_pass_active(self.settings):
             return
         if self.settings.get("extended", False):
@@ -961,7 +1207,13 @@ class AutoClipApp:
             self._show_extension_survey()
 
     def _show_extension_survey(self) -> None:
-        """Pro版使用感アンケート → 期間延長。"""
+        """
+        【役割】Pro版の使用感アンケートを収集し、回答後に Holiday Pass を7日延長する。
+
+        満足度・よく使った機能・自由記述の3問を収集する。
+        回答送信後に holiday_pass_end を +7日し、extended フラグを True にして保存する。
+        これによりユーザーエンゲージメントの維持とフィードバック収集を同時に行う。
+        """
         win = tk.Toplevel(self.root)
         win.title("使用感アンケート — 期間延長")
         win.geometry("450x400")
@@ -1025,7 +1277,12 @@ class AutoClipApp:
     # ==================== ユーティリティ ====================
 
     def _open_output_folder(self) -> None:
-        """OBSの保存先フォルダをOSで開く。"""
+        """
+        【役割】OBS の録画出力先フォルダを OS のファイルエクスプローラーで開く。
+
+        OBS に接続済みなら output_dir を、未接続ならホームディレクトリを開く。
+        macOS / Windows / Linux に対応したコマンドを選択して実行する。
+        """
         if self.obs_controller and self.obs_controller.output_dir:
             path = self.obs_controller.output_dir
         else:
@@ -1040,12 +1297,25 @@ class AutoClipApp:
             subprocess.Popen(["xdg-open", path])
 
     def _log(self, message: str) -> None:
-        """スレッドセーフなログ追加。キューに入れてメインスレッドで処理。"""
+        """
+        【役割】別スレッドから安全にログメッセージを GUI のログ欄へ送るためのキューに積む。
+
+        Tkinter はシングルスレッドのため、ChatMonitor などの別スレッドから
+        直接ウィジェットを操作するとクラッシュする。
+        そのためキューを介してメインスレッド（_poll_log_queue）に委ねる方式をとる。
+        タイムスタンプを自動で付加する。
+        """
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put(f"[{timestamp}] {message}")
 
     def _poll_log_queue(self) -> None:
-        """キューからログメッセージを取り出して表示する（50msごと）。"""
+        """
+        【役割】メインスレッドで 50ms ごとにログキューを処理し、GUI のログ欄に表示する。
+
+        root.after() で自己再帰的にスケジュールし、アプリ起動中は常に実行し続ける。
+        キューにメッセージが溜まっている間は全て取り出して表示し、
+        ScrolledText を末尾に自動スクロールすることで最新ログが常に見える状態を保つ。
+        """
         while not self.log_queue.empty():
             try:
                 msg = self.log_queue.get_nowait()
